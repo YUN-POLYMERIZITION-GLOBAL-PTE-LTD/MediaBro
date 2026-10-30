@@ -1,0 +1,26 @@
+import os
+
+def get_current_directory():
+    return os.path.dirname(os.path.abspath(__file__))
+
+def get_media_directory():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "videos")
+
+def get_media_files():
+    directory = get_media_directory()
+    
+    media_extensions = {'.mp4'}
+    media_files = []
+    
+    try:
+        for item in os.scandir(directory):
+            if item.is_file():
+                ext = os.path.splitext(item.name)[1].lower()
+                if ext in media_extensions:
+                    media_files.append(item.path)
+    except OSError as e:
+        print(f"Error: {directory} : {e}")
+        return None
+    
+    media_files.sort(key=lambda a: a.lower())
+    return media_files

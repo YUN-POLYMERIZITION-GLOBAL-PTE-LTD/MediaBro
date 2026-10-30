@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Playing: {{ filename }}</title>
+    <!-- Socket.IO client — matches the Flask-SocketIO server version -->
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #000;
+            color: #fff;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+        }
+        video {
+            width: 100%;
+            max-width: 960px;
+            max-height: 80vh;
+            background: #111;
+            border-radius: 8px;
+        }
+        #status {
+            margin-top: 16px;
+            padding: 10px 20px;
+            font-size: 14px;
+            border-radius: 20px;
+            background: rgba(255,255,255,0.08);
+            transition: all 0.3s ease;
+        }
+        #status.success { background: rgba(76,175,80,0.2); color: #81c784; }
+        #status.error   { background: rgba(244,67,54,0.2);  color: #e57373; }
+        #progress {
+            margin-top: 8px;
+            width: 100%;
+            max-width: 960px;
+            height: 4px;
+            background: rgba(255,255,255,0.1);
+            border-radius: 2px;
+            overflow: hidden;
+            display: none;
+        }
+        #progress-bar {
+            height: 100%;
+            background: #4caf50;
+            width: 0%;
+            transition: width 0.2s;
+        }
+    </style>
+</head>
+<body>
+    <video id="video" controls autoplay muted playsinline></video>
+    <div id="progress"><div id="progress-bar"></div></div>
+    <div id="status">⏳ Initializing...</div>
+
+    <script>
+        const FILENAME = {{ filename | tojson }};
+        const video    = document.getElementById('video');
+        const status   = document.getElementById('status');
+        const progress = document.getElementById('progress');
+        const bar      = document.getElementById('progress-bar');
+
+        let bytesRecv  = 0;
+        let disposePlayer = () => {};
+        let transferFailed = false;
+        let playbackVersion = 0;
+        let disposeMedia = () => {};
+        let blobUrl = null;
+
+        function clearPlayback() {
+            playbackVersion++;
+            disposeMedia();
+            disposeMedia = () => {};
+            video.onerror = null;
+            if (blobUrl) {
+                URL.revokeObjectURL(blobUrl);
+                blobUrl = null;
+            }
+        }
+
+        // ── Helper: update status text ──────────────────────────
+        function setStatus(text, cls) {
+            status.textContent = text;
+            status.className = cls || '';
+        }
+
+        // ── Main entry point ────────────────────────────────────
+        async function startPlayer() {
+            clearPlayback();
+            transferFailed = false;
+            bytesRecv = 0;
+            setStatus('🔌 Connecting to signaling server...');
+
+            // 1. Connect to Flask-SocketIO signaling (same origin, no extra port)
+            const socket = io();
+
+            // 2. Create WebRTC peer connection with STUN for NAT traversal
+            const pc = new RTCPeerConnection({
+                iceServers: [
+                    { urls: 'stun:stun.l.google.com:19302' },
+                    { urls: 'stun:stun1.l.google.com:19302' },
+                    { urls: 'stun:stun.cloudflare.com:3478' },
+                    { urls: 'stun:global.stun.twilio.com:3478'}
+                ],
+                iceCandidatePoolSize: 10
+            });
+
+            // 3. Create ordered DataChannel for reliable media delivery
+            const dc = pc.createDataChannel('media', { ordered: true });
+            dc.binaryType = 'arraybuffer';
+
+            // 4. Append fragmented MP4 as it arrives over the ordered channel.
+            let disposed = false;
+            let connectedOnce = false;
+            let mediaSource = null;
+            let sourceBuffer = null;
+            let queue = [];
+            let queuedBytes = 0;
+            let receivedDone = false;
+            let receiverPaused = false;
+            let mediaDisposed = false;
+            let playRequested = false;
+            let gotMetadata = false;
+            let streamDuration = 0;
+            let lastReport = 0;
+            const MAX_QUEUE = 16 * 1024 * 1024;
+
+            disposePlayer = () => {
+                if (disposed) return;
+                disposed = true;
+                socket.removeAllListeners();
+                pc.onicecandidate = null;
+                pc.onconnectionstatechange = null;
+                dc.onmessage = null;
+                dc.onopen = null;
+                dc.onclose = null;
+                dc.close();
+                pc.close();
+                socket.disconnect();
+            };
+
+            disposeMedia = () => {
+                mediaDisposed = true;
+                queue = [];
+                queuedBytes = 0;
+                video.oncanplay = null;
+                video.ontimeupdate = null;
+                video.onseeking = null;
+                video.onwaiting = null;
+                video.onplaying = null;
+                if (sourceBuffer) {
+                    sourceBuffer.onupdateend = null;
+                    sourceBuffer.onerror = null;
+                }
+                if (mediaSource) mediaSource.onsourceopen = null;
+            };
+
+            function bufferedAhead() {
+                if (!sourceBuffer || !sourceBuffer.buffered.length) return 0;
+                for (let i = 0; i < sourceBuffer.buffered.length; i++) {
+                    if (video.currentTime >= sourceBuffer.buffered.start(i) && video.currentTime < sourceBuffer.buffered.end(i)) {
+                        return sourceBuffer.buffered.end(i) - video.currentTime;
+                    }
+                }
+                // A future range cannot keep the current playback position fed.
+                return 0;
+            }
+
+            function reportPlayback(event, reason = '') {
+                if (disposed || dc.readyState !== 'open') return;
+                const now = Date.now();
+                if (event === 'progress' && now - lastReport < 10000) return;
+                lastReport = now;
+                dc.send('playback:' + JSON.stringify({
+                    event, time: video.currentTime, ahead: bufferedAhead(),
+                    bytes: bytesRecv, queued: queuedBytes, paused: video.paused,
+                    receiverPaused, ready: video.readyState, reason: String(reason).slice(0, 200),
+                }));
+            }
+
+            function constrainSeek() {
+                if (!sourceBuffer || !sourceBuffer.buffered.length) return;
+                const ranges = sourceBuffer.buffered;
+                let nearest = ranges.start(0);
+                let distance = Infinity;
+                for (let i = 0; i < ranges.length; i++) {
+                    const start = ranges.start(i);
+                    const end = ranges.end(i);
+                    if (video.currentTime >= start && video.currentTime <= end - .1) return;
+                    const candidate = Math.max(start, Math.min(video.currentTime, end - .1));
+                    if (Math.abs(candidate - video.currentTime) < distance) {
+                        nearest = candidate;
+                        distance = Math.abs(candidate - video.currentTime);
+                    }
+                }
+                if (Math.abs(video.currentTime - nearest) < .001) return;
+                video.currentTime = nearest;
+                setStatus('Only buffered video can be seeked. Continuing P2P playback…');
+            }
+
+            function updateFlow() {
+                if (receivedDone || disposed || dc.readyState !== 'open') return;
+                const ahead = bufferedAhead();
+                const pause = queuedBytes > 4 * 1024 * 1024 || ahead > 30;
+                const resume = queuedBytes < 1024 * 1024 && ahead < 15;
+                if (!receiverPaused && pause) {
+                    dc.send('pause');
+                    receiverPaused = true;
+                } else if (receiverPaused && resume) {
+                    dc.send('resume');
+                    receiverPaused = false;
+                }
+            }
+
+            function pump() {
+                if (mediaDisposed || transferFailed || !sourceBuffer || sourceBuffer.updating || mediaSource.readyState !== 'open') return;
+                try {
+                    // Keep recent history for seeking without retaining the whole movie.
+                    const removeBefore = video.currentTime - 30;
+                    if (removeBefore > 0 && sourceBuffer.buffered.length && sourceBuffer.buffered.start(0) < removeBefore - 1) {
+                        sourceBuffer.remove(0, removeBefore);
+                        return;
+                    }
+                    if (queue.length) {
+                        sourceBuffer.appendBuffer(queue[0]);
+                        queuedBytes -= queue.shift().byteLength;
+                    } else if (receivedDone) {
+                        mediaSource.endOfStream();
+                    }
+                    updateFlow();
+                } catch (err) {
+                    if (err.name === 'QuotaExceededError') {
+                        // Retry on timeupdate after played data can be evicted.
+                        if (!receiverPaused && !disposed) {
+                            dc.send('pause');
+                            receiverPaused = true;
+                        }
+                        return;
+                    }
+                    failP2P('Cannot append video data: ' + err.message);
+                }
+            }
+
+            function startMedia(msg) {
+                if (gotMetadata || msg.mode !== 'mse' || typeof MediaSource === 'undefined' || !MediaSource.isTypeSupported(msg.mime)) {
+                    failP2P('This browser does not support the streaming video codec.');
+                    return;
+                }
+                gotMetadata = true;
+                streamDuration = Number.isFinite(msg.duration) ? msg.duration : 0;
+                mediaSource = new MediaSource();
+                blobUrl = URL.createObjectURL(mediaSource);
+                video.src = blobUrl;
+                video.muted = true;
+                video.onerror = () => {
+                    reportPlayback('error', video.error?.message || 'Video decoding failed');
+                    failP2P('Video decoding failed.');
+                };
+                video.oncanplay = () => {
+                    if (mediaDisposed || playRequested) return;
+                    playRequested = true;
+                    const version = playbackVersion;
+                    video.play().then(() => {
+                        if (!mediaDisposed && version === playbackVersion) setStatus('▶ Playing via P2P while downloading', 'success');
+                    }).catch(err => {
+                        if (mediaDisposed) return;
+                        if (err.name === 'NotAllowedError') setStatus('Video ready. Press play to start.', 'success');
+                        else failP2P('Cannot start playback: ' + err.message);
+                    });
+                };
+                video.ontimeupdate = () => { updateFlow(); pump(); reportPlayback('progress'); };
+                video.onseeking = () => { constrainSeek(); updateFlow(); pump(); reportPlayback('seeking'); };
+                video.onwaiting = () => {
+                    updateFlow(); pump(); reportPlayback('waiting');
+                    setStatus('Buffering P2P video…');
+                };
+                video.onplaying = () => {
+                    reportPlayback('playing');
+                    setStatus('▶ Playing via P2P while downloading', 'success');
+                };
+                mediaSource.onsourceopen = () => {
+                    if (mediaDisposed || sourceBuffer) return;
+                    try {
+                        sourceBuffer = mediaSource.addSourceBuffer(msg.mime);
+                        if (streamDuration > 0) mediaSource.duration = streamDuration;
+                        sourceBuffer.onupdateend = () => {
+                            if (streamDuration > 0 && sourceBuffer.buffered.length) {
+                                bar.style.width = Math.min(100, sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1) / streamDuration * 100) + '%';
+                            }
+                            updateFlow();
+                            pump();
+                        };
+                        sourceBuffer.onerror = () => failP2P('Invalid video segment.');
+                        pump();
+                    } catch (err) {
+                        failP2P('Cannot initialize video buffer: ' + err.message);
+                    }
+                };
+                progress.style.display = 'block';
+                setStatus('Buffering P2P video…');
+            }
+
+            // 5. Metadata initializes MSE; binary chunks immediately feed its queue.
+            dc.onmessage = (event) => {
+                const data = event.data;
+                if (typeof data === 'string') {
+                    let msg;
+                    try {
+                        msg = JSON.parse(data);
+                        if (!msg || typeof msg !== 'object') throw new Error('Invalid message');
+                    } catch (err) {
+                        failP2P('Invalid streaming message.');
+                        return;
+                    }
+                    if (msg.type === 'meta') startMedia(msg);
+                    else if (msg.type === 'done') {
+                        if (!gotMetadata || receivedDone || bytesRecv <= 0 || bytesRecv !== msg.size) {
+                            failP2P('Incomplete video stream.');
+                            return;
+                        }
+                        receivedDone = true;
+                        // Playback buffers outlive the completed transport.
+                        disposePlayer();
+                        pump();
+                    } else if (msg.error) failP2P(msg.error);
+                    return;
+                }
+                if (!gotMetadata || receivedDone || !(data instanceof ArrayBuffer)) {
+                    failP2P('Unexpected video data.');
+                    return;
+                }
+                queue.push(new Uint8Array(data));
+                bytesRecv += data.byteLength;
+                queuedBytes += data.byteLength;
+                if (queuedBytes > MAX_QUEUE) {
+                    failP2P('Playback buffer exceeded its limit.');
+                    return;
+                }
+                updateFlow();
+                pump();
+            };
+
+            dc.onopen = () => {
+                if (typeof MediaSource === 'undefined') {
+                    failP2P('This browser does not support streaming playback.');
+                    return;
+                }
+                setStatus('Requesting P2P video stream…');
+                dc.send('stream:' + FILENAME);
+            };
+            dc.onclose = () => {
+                if (!disposed && !transferFailed) failP2P('P2P stream disconnected.');
+            };
+
+            // 6. WebRTC signaling via Socket.IO ──────────────────
+
+            // When Socket.IO is connected, create and send an SDP offer
+            socket.on('connect', async () => {
+                if (disposed || transferFailed) return;
+                if (connectedOnce) {
+                    if (dc.readyState === 'open') {
+                        // The old P2P transport still works; do not offer it to
+                        // the new server-side peer created for this Socket.IO SID.
+                        socket.disconnect();
+                        return;
+                    }
+                    disposePlayer();
+                    await startPlayer();
+                    return;
+                }
+                connectedOnce = true;
+                try {
+                    setStatus('🤝 Creating WebRTC offer...');
+                    const offer = await pc.createOffer();
+                    if (disposed) return;
+                    await pc.setLocalDescription(offer);
+                    if (!disposed && socket.connected) {
+                        socket.emit('offer', { sdp: pc.localDescription.sdp });
+                    }
+                } catch (err) {
+                    if (!disposed) failP2P();
+                }
+            });
+
+            // Receive SDP answer from the server
+            socket.on('answer', async (data) => {
+                if (disposed) return;
+                try {
+                    await pc.setRemoteDescription(
+                        new RTCSessionDescription({ sdp: data.sdp, type: 'answer' })
+                    );
+                } catch (err) {
+                    if (!disposed) failP2P();
+                }
+            });
+
+            socket.on('signaling_error', (data) => {
+                if (!disposed) failP2P(data?.error);
+            });
+
+            // Relay ICE candidates: browser → server
+            pc.onicecandidate = (e) => {
+                if (e.candidate && socket.connected && !disposed) {
+                    socket.emit('ice_candidate', {
+                        candidate: e.candidate.candidate,
+                        sdpMid: e.candidate.sdpMid,
+                        sdpMLineIndex: e.candidate.sdpMLineIndex
+                    });
+                }
+            };
+
+            // Relay ICE candidates: server → browser
+            socket.on('ice_candidate', async (data) => {
+                if (data.candidate) {
+                    try {
+                        await pc.addIceCandidate(new RTCIceCandidate({
+                            candidate: data.candidate,
+                            sdpMid: data.sdpMid,
+                            sdpMLineIndex: data.sdpMLineIndex
+                        }));
+                    } catch (e) {
+                        console.warn('[WebRTC] Failed to add ICE candidate:', e);
+                    }
+                }
+            });
+
+            // 7. Connection state monitoring ─────────────────────
+            pc.onconnectionstatechange = () => {
+                console.log('WebRTC state:', pc.connectionState);
+                switch (pc.connectionState) {
+                    case 'connected':
+                        setStatus('✅ P2P connected — downloading file...', 'success');
+                        break;
+                    case 'closed':
+                    case 'failed':
+                        setStatus('⚠️ P2P failed — please reload to retry.', 'error');
+                        failP2P();
+                        break;
+                    case 'disconnected':
+                        setStatus('🔌 Disconnected');
+                        break;
+                }
+            };
+
+            // 8. Socket.IO connection error handling
+            socket.on('connect_error', () => {
+                if (disposed || dc.readyState === 'open') return;
+                setStatus('⚠️ Signaling error — please reload to retry.', 'error');
+                failP2P();
+            });
+        }
+
+        // ── Pure P2P: report failures without downloading over HTTP ──
+        function failP2P(reason = 'P2P connection or playback failed.') {
+            if (transferFailed) return;
+            transferFailed = true;
+            disposePlayer();
+            clearPlayback();
+            video.src = '';
+            setStatus('❌ ' + reason + ' Please reload to retry.', 'error');
+            progress.style.display = 'none';
+        }
+        window.addEventListener('pagehide', () => {
+            disposePlayer();
+            clearPlayback();
+        });
+
+        // Go!
+        startPlayer();
+    </script>
+</body>
+</html>
