@@ -55,7 +55,7 @@ permissions:
   - network:access:internet
 ---
 
-# MediaSync-Claw
+# MediaBro
 
 ## 🚀 Overview
 

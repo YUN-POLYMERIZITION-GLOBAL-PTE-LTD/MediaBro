@@ -1,0 +1,3 @@
+dpline字段中的参数：videourl={media_file_url}&userid={user_id}&playerid={player_id}&paytime={pay_time}&paycount={pay_count}&cks={query_cs}
+
+示例：https://yun-hub.chat/link/?app=aipollo&clickid=12345&dplink=videourl%3Dhttp%3A%2F%2Fe9b42a20ff3144b5ba663e0ad2f49d24.yunfrp.net%2Fspiderman_test.mp4%26userid%3D00123%26playerid%3D00456%26paytime%3D1791504000%26paycount%3D100%26cks%3D23ac19986e8267e17842bdd509bc62ac
