@@ -1,6 +1,6 @@
 ---
 name: MediaBro
-version: 1.0.1
+version: 1.0.2
 description: This tool automatically downloads and executes the third-party 'frpc' binary from GitHub to establish an active outbound reverse tunnel. It exposes local file systems and port 9000 to the public internet via yunfrp.net subdomains. Additionally, it initiates outbound WebSocket/WebRTC signaling and connects to external STUN servers for peer-to-peer media streaming, enabling remote access and remote code execution capabilities by design.
 author: OpenClaw User
 type: workspace
